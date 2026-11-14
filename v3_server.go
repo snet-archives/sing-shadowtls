@@ -7,15 +7,21 @@ import (
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"net"
+	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 )
+
+var errServerRecordRead = errors.New("read server record")
 
 func extractFrame(conn net.Conn) (*buf.Buffer, error) {
 	var tlsHeader [tlsHeaderSize]byte
@@ -168,13 +174,14 @@ func copyByFrameUntilHMACMatches(conn net.Conn, handshakeConn net.Conn, hmacVeri
 	}
 }
 
-func copyByFrameWithModification(conn net.Conn, handshakeConn net.Conn, password string, serverRandom []byte, hmacWrite hash.Hash) error {
+func copyByFrameWithModification(conn net.Conn, handshakeConn net.Conn, password string, serverRandom []byte, hmacWrite hash.Hash, handshakeFinished *atomic.Bool) error {
 	writeKey := kdf(password, serverRandom)
 	writer := bufio.NewVectorisedWriter(handshakeConn)
+	var tightened bool
 	for {
 		frameBuffer, err := extractFrame(conn)
 		if err != nil {
-			return E.Cause(err, "read server record")
+			return fmt.Errorf("%w: %w", errServerRecordRead, err)
 		}
 		frame := frameBuffer.Bytes()
 		if frame[0] == applicationData {
@@ -186,6 +193,10 @@ func copyByFrameWithModification(conn net.Conn, handshakeConn net.Conn, password
 			frameBuffer.Release()
 			if err != nil {
 				return E.Cause(err, "write modified server frame")
+			}
+			if !tightened && handshakeFinished != nil && handshakeFinished.Load() {
+				tightened = true
+				_ = conn.SetReadDeadline(time.Now().Add(postHandshakeDrainTail))
 			}
 		} else {
 			_, err = handshakeConn.Write(frame)

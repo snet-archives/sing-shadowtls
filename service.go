@@ -5,8 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net"
 	"os"
+	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -257,19 +261,21 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 
 		var clientFirstFrame *buf.Buffer
 		var group task.Group
-		var handshakeFinished bool
+		var handshakeFinished atomic.Bool
 		group.Append("client handshake relay", func(ctx context.Context) error {
 			clientFrame, cErr := copyByFrameUntilHMACMatches(conn, handshakeConn, hmacVerify, hmacVerifyReset)
 			if cErr == nil {
 				clientFirstFrame = clientFrame
-				handshakeFinished = true
-				handshakeConn.Close()
+				// Bound handshakeConn read deadline before publishing handshakeFinished
+				// so server relay sees the window cleanly and can tighten it on tickets.
+				_ = handshakeConn.SetReadDeadline(time.Now().Add(postHandshakeTicketWindow))
+				handshakeFinished.Store(true)
 			}
 			return cErr
 		})
 		group.Append("server handshake relay", func(ctx context.Context) error {
-			cErr := copyByFrameWithModification(handshakeConn, conn, user.Password, serverRandom, hmacWrite)
-			if E.IsClosedOrCanceled(cErr) && handshakeFinished {
+			cErr := copyByFrameWithModification(handshakeConn, conn, user.Password, serverRandom, hmacWrite, &handshakeFinished)
+			if handshakeFinished.Load() && isExpectedPostHandshakeReadErr(cErr) {
 				return nil
 			}
 			return cErr
@@ -285,4 +291,20 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		s.handler.NewConnectionEx(ctx, bufio.NewCachedConn(newVerifiedConn(conn, hmacAdd, hmacVerify, nil), clientFirstFrame), source, destination, onClose)
 		return nil
 	}
+}
+
+const (
+	postHandshakeTicketWindow = 150 * time.Millisecond
+	postHandshakeDrainTail    = 20 * time.Millisecond
+)
+
+func isExpectedPostHandshakeReadErr(err error) bool {
+	if !errors.Is(err, errServerRecordRead) {
+		return false
+	}
+	if E.IsClosedOrCanceled(err) || E.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
