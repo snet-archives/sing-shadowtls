@@ -164,14 +164,25 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 			return err
 		}
 	case 3:
-		clientHelloFrame, err := extractFrame(conn)
+		clientHelloFrame, validHello, err := extractClientHelloFrame(conn)
 		if err != nil {
 			return E.Cause(err, "read client handshake")
 		}
 		defer clientHelloFrame.Release()
+		if !validHello {
+			handshakeConn, dialErr := s.handshake.Dialer.DialContext(ctx, N.NetworkTCP, s.handshake.Server)
+			if dialErr != nil {
+				return E.Cause(dialErr, "server handshake")
+			}
+			return copyFallbackConn(ctx, conn, clientHelloFrame, handshakeConn)
+		}
 		serverName, err := extractServerName(clientHelloFrame.Bytes())
 		if err != nil {
-			return E.Cause(err, "extract server name")
+			handshakeConn, dialErr := s.handshake.Dialer.DialContext(ctx, N.NetworkTCP, s.handshake.Server)
+			if dialErr != nil {
+				return E.Cause(dialErr, "server handshake")
+			}
+			return copyFallbackConn(ctx, conn, clientHelloFrame, handshakeConn)
 		}
 		var (
 			handshakeConfig HandshakeConfig
@@ -201,7 +212,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 			if err != nil {
 				return E.Cause(err, "server handshake")
 			}
-			return bufio.CopyConn(ctx, bufio.NewCachedConn(conn, clientHelloFrame), handshakeConn)
+			return copyFallbackConn(ctx, conn, clientHelloFrame, handshakeConn)
 		}
 		if user.Name != "" {
 			ctx = auth.ContextWithUser(ctx, user.Name)
